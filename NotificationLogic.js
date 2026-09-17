@@ -14,6 +14,14 @@ function sanitizeBody(body, app, appIcon) {
     .replace(/^\s*(?:https?:\/\/|www\.)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?::\d+)?(?:\/\S*)?\s+/i, "")
 }
 
+// The notification server advertises bodyMarkupSupported, so a body may carry
+// markup and has to be rendered as StyledText or the tags show up as text.
+// Same shape as the shell's own card: sanitize, then make real newlines into
+// breaks, since StyledText collapses them.
+function styledBody(body, app, appIcon) {
+  return sanitizeBody(body, app, appIcon).replace(/\r\n|\r|\n/g, "<br/>")
+}
+
 function summaryStartsWithGlyph(summary) {
   var text = String(summary || "").replace(/^\s+/, "")
   if (!text) return false
@@ -77,6 +85,33 @@ function snapshotOf(notification, timestamp) {
   }
 }
 
+// Validate a notification's click action into an argv vector, or null.
+//
+// Same checks the shell's own service makes before running one: valid JSON, a
+// non-empty array of strings, and a program that argv would not read as an
+// option. It does not judge intent -- a well-formed ["bash","-c",...] passes.
+// Which senders may set the hint at all is the session bus's boundary, not
+// this widget's: any same-uid process can, by the freedesktop protocol's
+// design, and Omarchy's own toasts are what use it.
+function parseExecArgv(value) {
+  var text = String(value || "")
+  if (!text) return null
+
+  var parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (e) {
+    return null
+  }
+
+  if (!Array.isArray(parsed) || parsed.length === 0) return null
+  for (var i = 0; i < parsed.length; i++) {
+    if (typeof parsed[i] !== "string") return null
+  }
+  if (!parsed[0] || parsed[0].charAt(0) === "-") return null
+  return parsed
+}
+
 function historyEntry(value, normalUrgency) {
   var e = value || {}
   return {
@@ -88,6 +123,7 @@ function historyEntry(value, normalUrgency) {
     body: e.body || "",
     image: e.image || "",
     glyph: e.glyph || "",
+    execArgv: e.execArgv || "",
     urgency: typeof e.urgency === "number" ? e.urgency : normalUrgency,
     expireTimeout: 0,
     timestamp: e.timestamp || 0
@@ -110,6 +146,35 @@ function dedupeByOriginalId(rows) {
   for (var id in keep) out.push(keep[id])
   out.sort(function(a, b) { return (b.timestamp || 0) - (a.timestamp || 0) })
   return out
+}
+
+// Rows read straight out of the notification service's history directory.
+//
+// `raw` is one line per file: the file's path, a tab, then the JSON object the
+// service wrote into it. Each file holds exactly one notification, so a line
+// parses on its own and a half-written file costs one row rather than the
+// whole list. The directory is already one file per notification -- no two
+// entries describe the same one -- so these are only sorted, never deduped:
+// ids restart at 1 with every shell generation, and collapsing by id would
+// silently merge yesterday's notification 3 with today's.
+function recentFromFiles(raw, normalUrgency) {
+  var lines = String(raw || "").split("\n")
+  var rows = []
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i]
+    if (!line) continue
+    var tab = line.indexOf("\t")
+    if (tab === -1) continue
+    var entry
+    try {
+      entry = JSON.parse(line.substring(tab + 1))
+    } catch (e) {
+      continue
+    }
+    rows.push(historyEntry(entry, normalUrgency))
+  }
+  rows.sort(function(a, b) { return (b.timestamp || 0) - (a.timestamp || 0) })
+  return rows
 }
 
 function parseHistory(raw, normalUrgency, historyCap) {
@@ -225,6 +290,7 @@ if (typeof module !== "undefined") {
   module.exports = {
     isChromiumDerived: isChromiumDerived,
     sanitizeBody: sanitizeBody,
+    styledBody: styledBody,
     summaryStartsWithGlyph: summaryStartsWithGlyph,
     shouldBypassDnd: shouldBypassDnd,
     isEphemeralApp: isEphemeralApp,
@@ -232,6 +298,8 @@ if (typeof module !== "undefined") {
     shouldRenderCompactGlyph: shouldRenderCompactGlyph,
     snapshotOf: snapshotOf,
     historyEntry: historyEntry,
+    parseExecArgv: parseExecArgv,
+    recentFromFiles: recentFromFiles,
     dedupeByOriginalId: dedupeByOriginalId,
     parseHistory: parseHistory,
     recentHistoryRows: recentHistoryRows,

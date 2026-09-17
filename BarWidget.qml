@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "NotificationLogic.js" as NotificationLogic
@@ -13,13 +14,51 @@ BarWidget {
   property bool popupOpen: false
   function close() { popupOpen = false }
 
-  // Always default to the pending tab when there's anything unseen, no
-  // matter how the popup was opened (click, keybind/IPC, or the close
-  // path). Keeps the spec from drifting based on the user's last manual
-  // tab selection.
-  onPopupOpenChanged: {
-    if (popupOpen) {
-      activeTab = pendingCount > 0 ? "pending" : "past"
+  // The list is read from disk each time the popup opens rather than kept in
+  // sync, so it costs nothing while closed and can never show a stale row.
+  onPopupOpenChanged: if (popupOpen) root.refreshRecent()
+
+  // Where the notifications actually are.
+  //
+  // Omarchy 4.0.4 stopped handing third-party bar widgets the notification
+  // service itself: firstPartyServiceFor() now returns a narrow proxy
+  // (PluginFirstPartyServiceApi) carrying doNotDisturb and setDoNotDisturb and
+  // nothing else, so the pendingModel/pastModel this popup was built on no
+  // longer exist and every row silently vanished. The notifications are still
+  // right there on disk though -- one JSON object per file, which is where the
+  // service keeps them and what its own showHistory replays -- so the list
+  // reads them directly. The service trims that directory to its own limit, so
+  // this shows exactly what it has kept.
+  readonly property string historyDir:
+    Quickshell.env("HOME") + "/.local/state/omarchy/notifications/history/"
+
+  ListModel { id: recentModel }
+
+  function refreshRecent() {
+    if (readRecent.running) return
+    readRecent.running = true
+  }
+
+  function loadRecent(raw) {
+    // Urgency 1 is Normal, and only covers a file that somehow carries no
+    // urgency of its own. Spelled out rather than imported so this widget does
+    // not depend on Quickshell.Services.Notifications just for the enum.
+    var rows = NotificationLogic.recentFromFiles(raw, 1)
+    recentModel.clear()
+    for (var i = 0; i < rows.length; i++) recentModel.append(rows[i])
+  }
+
+  Process {
+    id: readRecent
+    // One line per notification: its file path, a tab, then the file's JSON on
+    // a single line. Reading the whole directory in one subprocess keeps this
+    // to a single spawn per popup open.
+    command: ["bash", "-c",
+      'for f in "$1"*.json; do [ -f "$f" ] || continue; printf "%s\\t" "$f"; tr -d "\\n" < "$f"; printf "\\n"; done',
+      "--", root.historyDir]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadRecent(text)
     }
   }
 
@@ -35,6 +74,64 @@ BarWidget {
     return NotificationLogic.sanitizeBody(s, app, appIcon)
   }
 
+  function styledBody(s, app, appIcon) {
+    return NotificationLogic.styledBody(s, app, appIcon)
+  }
+
+  // What clicking a row does.
+  //
+  // Not the libnotify "default" action: that only lives as long as the sender's
+  // notification does, and every row here is one the server has already closed.
+  // The shell's own service refuses to invoke it for restored rows for exactly
+  // that reason -- the id belongs to a past generation and could fire an
+  // unrelated live notification's action.
+  //
+  // What does survive is the two things the service falls back to. Omarchy's
+  // own toasts carry their action as an argv vector that the history file
+  // preserves verbatim ("Screenshot saved", "Screen recording saved"), so that
+  // runs. Everything else -- a chat message, a VPN state change -- gets the
+  // sender's window focused, which is what clicking those is for anyway.
+  function activate(execArgv, app) {
+    var argv = NotificationLogic.parseExecArgv(execArgv)
+    if (argv) {
+      // Detached, so the action outlives the shell: some Omarchy toasts
+      // restart it.
+      Util.execArgv(argv)
+    } else if (String(app || "").length > 0) {
+      focusApp.appName = String(app)
+      focusApp.retried = false
+      focusApp.command = [root.focusAppBin, focusApp.appName]
+      focusApp.running = true
+    }
+    root.close()
+  }
+
+  readonly property string focusAppBin:
+    Quickshell.env("OMARCHY_PATH") + "/bin/omarchy-hyprland-focus-app"
+
+  // Focusing the sender is best-effort, and the helper matches its argument as
+  // a regex against the window class. Plenty of apps notify under a display
+  // name that is not their class -- "Telegram Desktop" against
+  // org.telegram.desktop -- so a miss is retried with the spaces turned into
+  // wildcards. That bridges exactly this gap without loosening the match into
+  // "any one word wins", which would let "Package Manager" grab a window that
+  // merely has "package" in its class.
+  Process {
+    id: focusApp
+    running: false
+    property string appName: ""
+    property bool retried: false
+
+    onExited: function(exitCode) {
+      if (exitCode === 0 || focusApp.retried) return
+      var pattern = focusApp.appName.replace(/\s+/g, ".*")
+      if (pattern === focusApp.appName) return
+      focusApp.retried = true
+      focusApp.command = [root.focusAppBin, pattern]
+      focusApp.running = true
+    }
+  }
+
   function notificationIconSource(icon) {
     var value = String(icon || "")
     if (value.length === 0) return ""
@@ -43,19 +140,9 @@ BarWidget {
     return Quickshell.iconPath(value, true)
   }
 
-  readonly property int pendingCount: notificationService ? notificationService.pendingModel.count : 0
-  readonly property int pastCount: notificationService ? notificationService.pastModel.count : 0
   readonly property bool dnd: notificationService ? notificationService.doNotDisturb : false
 
-  // Which tab is active in the popup. Auto-selects pending when there's
-  // something unseen; otherwise opens past.
-  property string activeTab: "pending"
-
-  readonly property string icon: {
-    if (dnd) return "󰂛"
-    if (pendingCount > 0) return "󱅫"
-    return "󰂚"
-  }
+  readonly property string icon: dnd ? "󰂛" : "󰂚"
 
   // Theme palette (mirrors HistoryPanel's tokens so the popup matches the
   // rest of the notification stack).
@@ -64,7 +151,7 @@ BarWidget {
   readonly property color colBorder: Style.normalBorderFor(Color.foreground, Color.accent)
   readonly property color colSurface: Style.normalFillFor(Color.foreground, Color.accent)
   readonly property color colAccent: Color.accent
-  readonly property int cardRadius: notificationService ? notificationService.cornerRadius : 0
+  readonly property int cardRadius: Style.cornerRadius
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -74,9 +161,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.icon
-    active: root.pendingCount > 0 && !root.dnd
-    tooltipText: root.dnd ? "Do Not Disturb"
-      : (root.pendingCount > 0 ? root.pendingCount + " pending" : "No notifications")
+    tooltipText: root.dnd ? "Do Not Disturb" : "Recent notifications"
 
     onPressed: function(b) {
       if (b === Qt.RightButton) {
@@ -160,90 +245,10 @@ BarWidget {
         }
       }
 
-      // ----------------------------------------- tabs
-      RowLayout {
-        Layout.fillWidth: true
-        spacing: 0
-
-        Repeater {
-          model: [
-            { key: "pending", label: "Pending",  count: root.pendingCount },
-            { key: "past",    label: "Recently", count: root.pastCount }
-          ]
-          delegate: Rectangle {
-            required property var modelData
-            readonly property bool isActive: root.activeTab === modelData.key
-
-            Layout.fillWidth: true
-            Layout.preferredHeight: Math.max(Style.space(30), Style.font.body + Style.spacing.controlPaddingY * 2)
-            color: "transparent"
-
-            Text {
-              anchors.centerIn: parent
-              text: modelData.label + (modelData.count > 0 ? "  " + modelData.count : "")
-              font.family: root.bar ? root.bar.fontFamily : ""
-              color: parent.isActive ? root.colForeground : root.colDim
-              font.pixelSize: Style.font.body
-              font.bold: parent.isActive
-            }
-
-            Rectangle {
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.bottom: parent.bottom
-              height: Math.max(1, Style.space(2))
-              color: parent.isActive ? root.colAccent : root.colBorder
-              opacity: parent.isActive ? 1 : 0.4
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.activeTab = modelData.key
-            }
-          }
-        }
-      }
-
-      // ----------------------------------------- action row
-      RowLayout {
-        Layout.fillWidth: true
-        visible: (root.activeTab === "pending" && root.pendingCount > 0)
-              || (root.activeTab === "past" && root.pastCount > 0)
-        spacing: Style.space(8)
-
-        Item { Layout.fillWidth: true }
-
-        BorderSurface {
-          Layout.preferredWidth: actionLabel.implicitWidth + Style.space(16)
-          Layout.preferredHeight: Math.max(Style.space(22), Style.font.bodySmall + Style.spacing.controlPaddingY * 2)
-          radius: Math.min(Style.space(6), root.cardRadius)
-          color: actionArea.containsMouse ? root.colBorder : "transparent"
-          borderSpec: Border.flat(root.colBorder, Style.normalBorderWidth)
-
-          Text {
-            id: actionLabel
-            anchors.centerIn: parent
-            text: root.activeTab === "pending" ? "Mark all as seen" : "Clear recent"
-            font.family: root.bar ? root.bar.fontFamily : ""
-            color: root.colForeground
-            font.pixelSize: Style.font.caption
-          }
-
-          MouseArea {
-            id: actionArea
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: {
-              if (!root.notificationService) return
-              if (root.activeTab === "pending") root.notificationService.markAllSeen()
-              else root.notificationService.clearPast()
-            }
-          }
-        }
-      }
-
+      // A single list, so no tabs. The two the popup used to have -- pending
+      // and past -- were the service's two models, and "pending" meant a toast
+      // still on screen, which the screen is already showing. What is left is
+      // the history, which is what "recent notifications" means here.
       // ----------------------------------------- list
       ListView {
         id: listView
@@ -252,9 +257,7 @@ BarWidget {
         clip: true
         spacing: Style.space(8)
 
-        readonly property bool onPending: root.activeTab === "pending"
-        model: !root.notificationService ? null
-              : (onPending ? root.notificationService.pendingModel : root.notificationService.pastModel)
+        model: recentModel
         visible: count > 0
 
         delegate: BorderSurface {
@@ -265,6 +268,7 @@ BarWidget {
           required property string summary
           required property string body
           required property string image
+          required property string execArgv
           required property int urgency
           required property double timestamp
 
@@ -273,17 +277,21 @@ BarWidget {
           readonly property string smallIconSource: image.length > 0 ? image : root.notificationIconSource(appIcon)
           readonly property bool hasIcon: !hasMedia && smallIconSource.length > 0
           readonly property string sanitizedBody: root.sanitizeBody(body, app, appIcon)
+          readonly property string styledMarkup: root.styledBody(body, app, appIcon)
 
           width: listView.width
           implicitHeight: rowContent.implicitHeight + Style.spacing.panelGap
           radius: root.cardRadius
-          color: "transparent"
+          // Lit on hover, so it reads as something you can click.
+          color: rowArea.containsMouse ? root.colSurface : "transparent"
           borderSpec: Border.flat(root.colBorder, Style.normalBorderWidth)
 
           MouseArea {
+            id: rowArea
             anchors.fill: parent
+            hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
-            onClicked: { /* no-op */ }
+            onClicked: root.activate(rowCard.execArgv, rowCard.app)
           }
 
           RowLayout {
@@ -336,9 +344,9 @@ BarWidget {
               Text {
                 Layout.fillWidth: true
                 visible: rowCard.sanitizedBody.length > 0
-                text: rowCard.sanitizedBody
+                text: rowCard.styledMarkup
                 font.family: root.bar ? root.bar.fontFamily : ""
-                textFormat: Text.PlainText
+                textFormat: Text.StyledText
                 color: root.colDim
                 font.pixelSize: Style.font.bodySmall
                 wrapMode: Text.WordWrap
@@ -347,32 +355,14 @@ BarWidget {
               }
             }
 
-            Rectangle {
-              Layout.preferredWidth: Style.space(18)
-              Layout.preferredHeight: Style.space(18)
+            // No per-row dismiss: the proxy has no way to remove one, and the
+            // service trims the directory itself as new notifications arrive.
+            Text {
               Layout.alignment: Qt.AlignVCenter
-              radius: Math.min(4, root.cardRadius)
-              color: rowCloseArea.containsMouse ? root.colBorder : "transparent"
-
-              Text {
-                anchors.centerIn: parent
-                text: "✕"
-                font.family: root.bar ? root.bar.fontFamily : ""
-                color: root.colDim
-                font.pixelSize: Style.font.bodySmall
-              }
-
-              MouseArea {
-                id: rowCloseArea
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  if (!root.notificationService) return
-                  if (listView.onPending) root.notificationService.dismissPending(rowCard.index)
-                  else root.notificationService.dismissPast(rowCard.index)
-                }
-              }
+              text: Qt.formatDateTime(new Date(rowCard.timestamp), "HH:mm")
+              font.family: root.bar ? root.bar.fontFamily : ""
+              color: root.colDim
+              font.pixelSize: Style.font.caption
             }
           }
         }
@@ -398,9 +388,7 @@ BarWidget {
 
           Text {
             Layout.alignment: Qt.AlignHCenter
-            text: root.activeTab === "pending"
-              ? "Nothing waiting for you"
-              : "Nothing recent"
+            text: "Nothing recent"
             font.family: root.bar ? root.bar.fontFamily : ""
             color: root.colDim
             font.pixelSize: Style.font.body
