@@ -156,7 +156,9 @@ BarWidget {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  WidgetButton {
+  // BarIconButton centres the glyph on its painted shape, not its advance
+  // box, so the bell sits in line with the other bar icons.
+  BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar
